@@ -43,7 +43,7 @@ jobs:
 
       - name: Collect failure context
         id: rca
-        uses: acme/ci-rca-collector@v1
+        uses: mayankagrwl/ci-rca-collector@v1
         with:
           run-id: ${{ github.event.workflow_run.id }}
           mode: ${{ github.event.workflow_run.conclusion == 'success' && 'train' || 'collect' }}
