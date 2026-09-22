@@ -20,37 +20,92 @@ jobs:
   collect:
     if: >
       github.event.workflow_run.conclusion == 'failure' ||
-      github.event.workflow_run.conclusion == 'cancelled' ||
-      github.event.workflow_run.conclusion == 'timed_out' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == github.event.repository.default_branch)
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Restore Drain3 baseline
+      # Sanitize workflow names before actions/cache. Keys must match
+      # ^[a-zA-Z0-9!#%'()+,-./<=>@_[{}~]+$ — spaces in names like
+      # "Build Api-gateway" cause HTTP 400 and the restore never hits.
+      #
+      # History must restore across runs of the SAME workflow. A run-id-only
+      # key (rca-history-160782) never hits on the next failure.
+      # actions/cache is still a ~7 day LRU.
+      - name: Sanitize cache keys
+        id: keys
+        shell: bash
+        env:
+          WF: ${{ github.event.workflow_run.name }}
+          JOB: ${{ github.job }}
+          REPO: ${{ github.repository }}
+        run: |
+          sanitize() {
+            local s="${1:-unknown}"
+            s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
+            s="$(printf '%s' "$s" | tr -s '[:space:]' '-')"
+            s="$(printf '%s' "$s" | sed -E 's/[^a-z0-9._-]+/-/g; s/-{2,}/-/g; s/^-+//; s/-+$//; s/^$/unknown/')"
+            printf '%s' "${s:0:80}"
+          }
+          wf="$(sanitize "$WF")"
+          job="$(sanitize "${JOB:-collect}")"
+          repo="$(sanitize "$REPO")"
+          {
+            echo "workflow=$wf"
+            echo "job=$job"
+            echo "repo=$repo"
+            echo "drain-cache-key=drain3-${wf}-${job}"
+            echo "drain-cache-restore-key=drain3-${wf}-"
+            echo "history-cache-key=rca-history-${repo}-${wf}"
+            echo "history-cache-restore-key=rca-history-${repo}-"
+          } >> "$GITHUB_OUTPUT"
+
+      # Combined cache@v4 (restore at start, save at job end). Nested
+      # actions/cache/restore and actions/cache/save are often missing on
+      # GHES mirrors ("repository not found").
+      - name: Cache Drain3 baseline
+        continue-on-error: true
         uses: actions/cache@v4
         with:
           path: .drain/
-          key: drain3-${{ github.event.workflow_run.name }}-${{ github.event.workflow_run.id }}
+          key: ${{ steps.keys.outputs.drain-cache-key }}
           restore-keys: |
-            drain3-${{ github.event.workflow_run.name }}-
+            ${{ steps.keys.outputs.drain-cache-restore-key }}
 
-      - name: Restore fingerprint history
+      - name: Cache fingerprint history
+        continue-on-error: true
         uses: actions/cache@v4
         with:
           path: .rca-history/
-          key: rca-history-${{ github.event.workflow_run.id }}
+          key: ${{ steps.keys.outputs.history-cache-key }}
           restore-keys: |
+            ${{ steps.keys.outputs.history-cache-restore-key }}
             rca-history-
 
       - name: Collect failure context
         id: rca
         uses: mayankagrwl/ci-rca-collector@master
+        env:
+          STGPT_API: ${{ secrets.STGPT_API }}
         with:
           run-id: ${{ github.event.workflow_run.id }}
           mode: ${{ github.event.workflow_run.conclusion == 'success' && 'train' || 'collect' }}
           github-token: ${{ secrets.COMMON_ACTIONS_PAT || github.token }}
           github-api-url: ''
+          analyze: true
+          workflow-name: ${{ github.event.workflow_run.name }}
+
+      - name: Report analysis
+        if: steps.rca.outputs.requires-analysis == 'true'
+        run: |
+          echo "Analysis status: ${{ steps.rca.outputs.analysis-status }}"
+          echo "Notes: ${{ steps.rca.outputs.analysis-notes }}"
+          echo "Confidence: ${{ steps.rca.outputs.rca-confidence }}"
+          echo "Root cause: ${{ steps.rca.outputs.root-cause }}"
+          echo "Suggested fix: ${{ steps.rca.outputs.suggested-fix }}"
+          if [ -f rca/summary.json ]; then
+            python -c "import json; a=(json.load(open('rca/summary.json')).get('analysis') or {}); print('summary.json status:', a.get('status')); print('summary.json notes:', '; '.join(a.get('notes') or []))"
+          fi
 
       - name: Upload artifact
         if: github.event.workflow_run.conclusion == 'failure'
